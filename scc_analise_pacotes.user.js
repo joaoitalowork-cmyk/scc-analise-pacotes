@@ -4,7 +4,7 @@
 
 // @namespace    https://logistics.amazon.com
 
-// @version      2.7.0
+// @version      2.8.0
 
 // @description  Análise de TBRs no SCC: Missing, Lost, Ageing e Geral
 
@@ -459,196 +459,59 @@
 
 
   function classifyMissing(result) {
-
     const { events } = result;
-
-    if (!events.length) return { type: 'MNR', rule: 0, reason: 'Sem eventos para analisar' };
-
-
-
-    // Ordena cronologicamente (mais antigo primeiro) usando stateTime
-
-    const sorted = [...events].sort((a, b) => (a.stateTime || 0) - (b.stateTime || 0));
-
-
-
-    // Regra 3 — base: só restringe a janela se MARKED_AS_MISSING for o TERMINAL
-
-    // (último evento ou bloco final de eventos). Se houver eventos DEPOIS do missing,
-
-    // analisa tudo normalmente — o pacote seguiu o fluxo após o missing.
-
-    const endsWithMissing = (sorted[sorted.length - 1]?.packageState || '').toUpperCase() === 'MARKED_AS_MISSING';
-
-    const hasMissingAnywhere = sorted.some(e => (e.packageState || '').toUpperCase() === 'MARKED_AS_MISSING');
-
-
-
-    let analysisPart, hasMissing;
-
-    if (endsWithMissing) {
-
-      // Encontra o início do bloco terminal de MARKED_AS_MISSING (podem ser vários consecutivos)
-
-      let cutIdx = sorted.length - 1;
-
-      while (cutIdx > 0 && (sorted[cutIdx - 1]?.packageState || '').toUpperCase() === 'MARKED_AS_MISSING') {
-
-        cutIdx--;
-
-      }
-
-      analysisPart = cutIdx > 0 ? sorted.slice(0, cutIdx) : sorted;
-
-      hasMissing   = true; // Terminal missing — janela restrita
-
-    } else {
-
-      // Missing existe no histórico mas NÃO é o último evento: analisa tudo
-
-      analysisPart = sorted;
-
-      hasMissing   = false; // Não restringe — há eventos posteriores ao missing
-
-    }
-
-
-
-    // Último evento relevante na janela de análise
-
-    const lastEvt = analysisPart.length ? analysisPart[analysisPart.length - 1] : null;
-
-
-
-    // ─── REGRA 1 ────────────────────────────────────────────────
-
-    // Último evento da janela tem packageState OU reasonCode = EOD_SCRUB / PAPERWORK_RECEIVED → MNR
-
-    // (descarta se houver eventos DEPOIS deles dentro da janela)
-
-    const MNR_TRIGGERS = ['EOD_SCRUB', 'PAPERWORK_RECEIVED'];
-
-    if (lastEvt) {
-
-      const evState  = (lastEvt.packageState || '').toUpperCase();
-
-      const evReason = (lastEvt.reasonCode   || '').toUpperCase();
-
-      const trigger  = MNR_TRIGGERS.find(t => t === evState || t === evReason);
-
-      if (trigger) {
-
-        const field = MNR_TRIGGERS.includes(evState) ? 'Status' : 'Motivo';
-
-        return {
-
-          type: 'MNR', rule: 1,
-
-          reason: `Último evento${hasMissing ? ' (anterior ao MARKED AS MISSING)' : ''} — ${field}: ${trigger.replace(/_/g, ' ')}`,
-
-          triggerEvt: lastEvt,
-
-          analysisPart, hasMissing, sorted,
-
-        };
-
-      }
-
-    }
-
-
-
-    // ─── REGRA 2 ────────────────────────────────────────────────
-
-    // MARKED FOR REPROCESS com origem diferente do destino do MANIFESTED → MNR
-
-    const manifestedEvt = sorted.find(e => (e.packageState || '').toUpperCase() === 'MANIFESTED') || sorted[0];
-
-    const reprocessEvt  = sorted.find(e => {
-
-      const s = (e.packageState || '').toUpperCase().replace(/[\s\-]+/g, '_');
-
-      return s.includes('MARKED_FOR_REPROCESS') || s.includes('FOR_REPROCESS');
-
-    });
-
-
-
-    if (reprocessEvt && manifestedEvt) {
-
-      const mDest = clean(manifestedEvt.destination);
-
-      const rSrc  = clean(reprocessEvt.source);
-
-      if (mDest !== '-' && rSrc !== '-' && mDest.toLowerCase() !== rSrc.toLowerCase()) {
-
-        return {
-
-          type: 'MNR', rule: 2,
-
-          reason: `MARKED FOR REPROCESS: origem "${rSrc}" ≠ destino do MANIFESTED "${mDest}"`,
-
-          manifestedEvt, reprocessEvt,
-
-          analysisPart, hasMissing, sorted,
-
-        };
-
-      }
-
-    }
-
-
-
-    // ─── REGRA 3 (LOGIN EDSP) ───────────────────────────────────
-
-    // Login @amazon.com em base EDSP (inicia com S ou P) → VÁLIDO
-
-    // Bases externas (ESA8, ESJ8...) não contabilizam
-
-    const loginEvts = analysisPart.filter(e => isEdspEvent(e));
-
-    if (loginEvts.length > 0) {
-
+    if (!events.length) return { type: 'MNR', rule: 0, reason: 'Sem eventos para analisar', sorted: [], analysisPart: [] };
+
+    const sorted     = [...events].sort((a, b) => (a.stateTime || 0) - (b.stateTime || 0));
+    const normState  = e => (e.packageState || '').toUpperCase().replace(/\s+/g, '_');
+    const normReason = e => (e.reasonCode   || '').toUpperCase().replace(/\s+/g, '_');
+
+    const hasMissingEvt = sorted.some(e => normState(e) === 'MARKED_AS_MISSING');
+
+    // ─── REGRA 1 — MARKED AS MISSING + PAPERWORK RECEIVED (OBS2, prioridade máxima)
+    const paperworkEvt = sorted.find(e =>
+      normState(e) === 'PAPERWORK_RECEIVED' || normReason(e) === 'PAPERWORK_RECEIVED'
+    );
+    if (hasMissingEvt && paperworkEvt) {
       return {
-
-        type: 'VALIDO', rule: 3,
-
-        reason: loginEvts.length + ' movimentação(ões) em base EDSP detectada(s)',
-
-        loginEvts, analysisPart, hasMissing, sorted,
-
+        type: 'MNR', rule: 1, obs: 'OBS2',
+        reason: 'MARKED AS MISSING + PAPERWORK RECEIVED detectados nos eventos',
+        triggerEvt: paperworkEvt,
+        analysisPart: sorted, sorted,
       };
-
     }
 
+    // ─── REGRA 2 — MARKED AS MISSING + EOD SCRUB (OBS2, prioridade máxima)
+    const eodEvt = sorted.find(e =>
+      normState(e) === 'EOD_SCRUB' || normReason(e) === 'EOD_SCRUB'
+    );
+    if (hasMissingEvt && eodEvt) {
+      return {
+        type: 'MNR', rule: 2, obs: 'OBS2',
+        reason: 'MARKED AS MISSING + EOD SCRUB detectados nos eventos',
+        triggerEvt: eodEvt,
+        analysisPart: sorted, sorted,
+      };
+    }
 
+    // ─── REGRA 3 — Qualquer login @amazon.com → VÁLIDO
+    const loginEvts = sorted.filter(e => isBaseLogin(e.scanAssociate));
+    if (loginEvts.length > 0) {
+      return {
+        type: 'VALIDO', rule: 3,
+        reason: loginEvts.length + ' login(s) @amazon.com detectado(s)',
+        loginEvts, analysisPart: sorted, sorted,
+      };
+    }
 
-    // Verifica se há logins Amazon mas todos em bases não-EDSP (informativo)
-
-    const nonEdspLogins = analysisPart.filter(e => isBaseLogin(e.scanAssociate) && !isEdspEvent(e));
-
-    const nonEdspNote = nonEdspLogins.length
-
-      ? ' (' + nonEdspLogins.length + ' login(s) em base não-EDSP desconsiderado(s))'
-
-      : '';
-
-
-
+    // ─── REGRA 4 — Nenhum login @amazon.com → MNR (só informa)
     return {
-
-      type: 'MNR', rule: 3,
-
-      reason: 'Nenhuma movimentação em base EDSP detectada' + nonEdspNote,
-
-      nonEdspLogins,
-
-      analysisPart, hasMissing, sorted,
-
+      type: 'MNR', rule: 4,
+      reason: 'Nenhum login @amazon.com nos eventos',
+      analysisPart: sorted, sorted,
     };
-
   }
+
 
 
 
@@ -771,308 +634,104 @@
   // ══════════════════════════════════════════════════════════
 
   function renderMissingCard(result, container) {
-
     const { tbr } = result;
-
     const c       = classifyMissing(result);
-
     const isVal   = c.type === 'VALIDO';
-
     const sorted  = c.sorted || [...result.events].sort((a,b) => (a.stateTime||0)-(b.stateTime||0));
-
     const last    = sorted[sorted.length - 1];
 
-    const hdrBg   = isVal ? '#e8f0fe' : '#fff0f0';
-
-    const hdrFg   = isVal ? '#1a3c5e' : '#8b0000';
+    const hdrBg  = isVal ? '#e8f0fe' : '#fff0f0';
+    const hdrFg  = isVal ? '#1a3c5e' : '#8b0000';
 
     const typeBdg = isVal
-
       ? `<span style="background:#1a7a4a;color:#fff;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700">&#10004; VÁLIDO</span>`
-
       : `<span style="background:#c0392b;color:#fff;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700">&#10006; MNR</span>`;
 
-    const mainIsRTO = isRTO(tbr);
+    const obs2Badge = c.obs === 'OBS2'
+      ? `<span style="background:#e74c3c;color:#fff;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:700;margin-left:4px;letter-spacing:.5px">OBS2</span>`
+      : '';
 
+    const mainIsRTO  = isRTO(tbr);
     const mainBadgeM = mainIsRTO
-
       ? `<span style="background:#6c3483;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:6px;font-weight:700">RTO</span>`
-
       : `<span style="background:#1a7a4a;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:6px;font-weight:700">TBR Original</span>`;
 
     const linkedBadgesM = (result.linkedTBRs || []).map(lt =>
-
       lt.isRTO
-
         ? `<span style="background:#6c3483;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:4px">RTO: ${lt.id}</span>`
-
         : `<span style="background:#1a7a4a;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:4px">Original: ${lt.id}</span>`
-
     ).join('');
 
-    const rtoTag = mainBadgeM + linkedBadgesM;
-
-
-
-    // Nota sobre janela de análise
-
-    const allSorted = c.sorted || [];
-
-    const hasMissingInHistory = allSorted.some(e => (e.packageState || '').toUpperCase() === 'MARKED_AS_MISSING');
-
-    const windowNote = c.hasMissing
-
-      // Missing é TERMINAL → avisa que a análise considera apenas os eventos anteriores
-
-      ? `<div style="font-size:11px;background:#fff8e1;border-left:3px solid #f0ad4e;padding:5px 10px;border-radius:3px;margin-bottom:8px;color:#856404">
-
-           &#128270; <strong>MARKED AS MISSING</strong> é o último evento — análise realizada nos eventos <strong>anteriores</strong> a ele
-
-         </div>`
-
-      // Missing existe no histórico mas NÃO é terminal → informa, mas analisa tudo
-
-      : hasMissingInHistory
-
-        ? `<div style="font-size:11px;background:#e8f5e9;border-left:3px solid #1a7a4a;padding:5px 10px;border-radius:3px;margin-bottom:8px;color:#155724">
-
-             &#9989; Existem eventos <strong>MARKED AS MISSING</strong> no histórico, mas há movimentações <strong>posteriores</strong> — análise realizada em todos os eventos
-
-           </div>`
-
-        : '';
-
-
-
-    // Eventos posteriores ao bloco terminal de MARKED_AS_MISSING (só quando é terminal)
-
-    const postMissingEvts = (c.hasMissing && c.sorted)
-
-      ? (() => {
-
-          const cutIdx = c.sorted.findIndex(e => (e.packageState||'').toUpperCase() === 'MARKED_AS_MISSING');
-
-          return cutIdx >= 0 ? c.sorted.slice(cutIdx) : [];
-
-        })()
-
-      : [];
-
-    const postMissingSection = postMissingEvts.length
-
-      ? `<div style="margin-top:12px">
-
-           <div style="font-size:11px;color:#9b59b6;font-weight:600;margin-bottom:4px;padding:4px 8px;background:#f5effe;border-radius:4px;display:inline-block">
-
-             &#8627; Eventos a partir do MARKED AS MISSING (${postMissingEvts.length})
-
-           </div>
-
-           ${buildTable(displayOrder(postMissingEvts), tbr + ' (pós-missing)', false, false)}
-
-         </div>` : '';
-
-
+    const linkedSections = (result.linkedTBRs || []).filter(lt => lt.events.length).map(lt => {
+      const color = lt.isRTO ? '#6c3483' : '#1a7a4a';
+      const label = lt.isRTO
+        ? `<strong style="color:#6c3483">&#8617; RTO:</strong> ${lt.id}`
+        : `<strong style="color:#1a7a4a">&#128230; TBR Original:</strong> ${lt.id}`;
+      return `<div style="margin-top:14px;border-top:2px dashed ${color};padding-top:12px">
+        ${buildTable(displayOrder(lt.events), lt.id + (lt.isRTO ? ' (RTO)' : ' (TBR Original)'), lt.isRTO, true)}
+      </div>`;
+    }).join('');
 
     let bodyContent = '';
 
-
-
     if (isVal) {
-
-      // VÁLIDO — mostra janela de análise com logins destacados
-
+      // VÁLIDO — histórico completo com logins @amazon.com destacados em verde
       bodyContent = `
-
-        ${windowNote}
-
         <div style="font-size:12px;padding:6px 10px;background:#e8f5e9;border-left:4px solid #1a7a4a;border-radius:4px;margin-bottom:8px">
-
-          &#10003; ${c.reason} — logins de base destacados em <strong style="color:#155724">verde</strong>
-
+          &#10003; ${c.reason} — logins destacados em <strong style="color:#155724">verde</strong>
         </div>
+        ${buildTable(displayOrder(sorted), tbr, mainIsRTO, true)}
+        ${linkedSections}`;
 
-        ${buildTable(displayOrder(c.analysisPart), tbr, false, true)}
-
-        ${postMissingSection}
-
-        ${(result.linkedTBRs || []).filter(lt => lt.events.length).map(lt =>
-          `<div style="margin-top:14px;border-top:2px dashed ${lt.isRTO ? '#6c3483' : '#1a7a4a'};padding-top:12px">${buildTable(displayOrder(lt.events), lt.id + (lt.isRTO ? ' (RTO)' : ' (TBR Original)'), true, true)}</div>`
-        ).join('')}`;
-
-
-
-    } else if (c.rule === 1) {
-
-      // MNR Regra 1 — EOD_SCRUB / PAPERWORK_RECEIVED como último evento
-
-      const ev = c.triggerEvt;
-
-      const evState = (ev?.packageState || '').replace(/_/g,' ');
-
+    } else if (c.rule === 1 || c.rule === 2) {
+      // MNR OBS2 — evento gatilho + histórico completo
+      const ev  = c.triggerEvt;
+      const lbl = c.rule === 1 ? 'PAPERWORK RECEIVED' : 'EOD SCRUB';
       bodyContent = `
-
-        ${windowNote}
-
-        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:8px">
-
-          <div style="font-size:13px;color:#8b0000;font-weight:700;margin-bottom:4px">&#9888; MNR — Regra 1: Último evento inválido</div>
-
-          <div style="font-size:12px;color:#555">${c.reason}</div>
-
-          ${ev ? `<table style="margin-top:8px;font-size:12px;border-collapse:collapse;width:100%">
-
+        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:10px">
+          <div style="font-size:13px;color:#8b0000;font-weight:700;margin-bottom:6px">&#9888; MNR OBS2 — ${c.reason}</div>
+          ${ev ? `<table style="font-size:12px;border-collapse:collapse;width:100%;margin-top:4px">
             <tr style="background:#fce8e6">
-
               <td style="padding:5px 8px;border:1px solid #f5c6cb;font-weight:600;white-space:nowrap">Evento gatilho</td>
-
               <td style="padding:5px 8px;border:1px solid #f5c6cb">${fmtDate(ev.stateTime)}</td>
-
-              <td style="padding:5px 8px;border:1px solid #f5c6cb"><strong>${evState}</strong></td>
-
+              <td style="padding:5px 8px;border:1px solid #f5c6cb"><strong>${lbl}</strong></td>
               <td style="padding:5px 8px;border:1px solid #f5c6cb">${clean(ev.source)}</td>
-
               <td style="padding:5px 8px;border:1px solid #f5c6cb">${clean(ev.destination)}</td>
-
             </tr></table>` : ''}
-
         </div>
-
-        ${postMissingSection}`;
-
-
-
-    } else if (c.rule === 2) {
-
-      // MNR Regra 2 — MARKED FOR REPROCESS com origem diferente
-
-      const mEv = c.manifestedEvt;
-
-      const rEv = c.reprocessEvt;
-
-      bodyContent = `
-
-        ${windowNote}
-
-        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:8px">
-
-          <div style="font-size:13px;color:#8b0000;font-weight:700;margin-bottom:4px">&#9888; MNR — Regra 2: Reprocessamento em local incorreto</div>
-
-          <div style="font-size:12px;color:#555;margin-bottom:8px">${c.reason}</div>
-
-          <table style="font-size:12px;border-collapse:collapse;width:auto">
-
-            <tr style="background:#e8f0fe">
-
-              <th style="padding:5px 10px;border:1px solid #c5d5f5;text-align:left">Evento</th>
-
-              <th style="padding:5px 10px;border:1px solid #c5d5f5;text-align:left">Data/Hora</th>
-
-              <th style="padding:5px 10px;border:1px solid #c5d5f5;text-align:left">Origem</th>
-
-              <th style="padding:5px 10px;border:1px solid #c5d5f5;text-align:left">Destino</th>
-
-            </tr>
-
-            ${mEv ? `<tr style="background:#f8f9fa">
-
-              <td style="padding:5px 10px;border:1px solid #dee2e6;white-space:nowrap"><strong>MANIFESTED</strong></td>
-
-              <td style="padding:5px 10px;border:1px solid #dee2e6">${fmtDate(mEv.stateTime)}</td>
-
-              <td style="padding:5px 10px;border:1px solid #dee2e6">${clean(mEv.source)}</td>
-
-              <td style="padding:5px 10px;border:1px solid #dee2e6;background:#fff3cd;font-weight:700">${clean(mEv.destination)}</td>
-
-            </tr>` : ''}
-
-            ${rEv ? `<tr style="background:#fff5f5">
-
-              <td style="padding:5px 10px;border:1px solid #dee2e6;white-space:nowrap"><strong>MARKED FOR REPROCESS</strong></td>
-
-              <td style="padding:5px 10px;border:1px solid #dee2e6">${fmtDate(rEv.stateTime)}</td>
-
-              <td style="padding:5px 10px;border:1px solid #dee2e6;background:#fce8e6;font-weight:700">${clean(rEv.source)}</td>
-
-              <td style="padding:5px 10px;border:1px solid #dee2e6">${clean(rEv.destination)}</td>
-
-            </tr>` : ''}
-
-          </table>
-
-        </div>
-
-        ${postMissingSection}`;
-
-
+        ${buildTable(displayOrder(sorted), tbr, mainIsRTO, false)}
+        ${linkedSections}`;
 
     } else {
-
-      // MNR Regra 3 — sem login em base EDSP
-
-      const nonEdspNote = (c.nonEdspLogins && c.nonEdspLogins.length)
-
-        ? `<div style="font-size:11px;margin-top:8px;padding:5px 10px;background:#fff8e1;border-left:3px solid #f0ad4e;border-radius:3px;color:#856404">
-
-             &#9888; ${c.nonEdspLogins.length} login(s) Amazon detectado(s) em base não-EDSP (desconsiderado):
-
-             <strong>${[...new Set(c.nonEdspLogins.map(e => clean(e.scanLocation) !== '-' ? clean(e.scanLocation) : clean(e.source)))].join(', ')}</strong>
-
-           </div>` : '';
-
+      // MNR Regra 4 — nenhum login @amazon.com, só informa (sem histórico)
       bodyContent = `
-
-        ${windowNote}
-
-        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px">
-
+        <div style="padding:12px 16px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px">
           <div style="display:flex;align-items:center;gap:10px">
-
-            <span style="font-size:20px">&#9888;</span>
-
-            <div><strong style="font-size:13px;color:#8b0000">MNR — Sem movimentação em base EDSP</strong><br>
-
-              <span style="font-size:12px;color:#666">${c.reason}</span></div>
-
+            <span style="font-size:22px">&#9888;</span>
+            <div>
+              <strong style="font-size:13px;color:#8b0000">MNR — Nenhum login @amazon.com</strong><br>
+              <span style="font-size:12px;color:#666">${c.reason}</span>
+            </div>
           </div>
-
-          ${nonEdspNote}
-
-        </div>
-
-        ${postMissingSection}`;
-
+        </div>`;
     }
 
-
-
     const card = document.createElement('div');
-
     card.className = 'scc-card';
-
     card.innerHTML = `
-
       <div class="scc-chdr" style="background:${hdrBg};color:${hdrFg}"
-
            onclick="(function(el){var b=el.nextElementSibling;b.style.display=b.style.display==='none'?'':'none';})(this)">
-
-        <span style="display:flex;align-items:center;gap:8px">
-
-          ${typeBdg} <strong>${tbr}</strong> ${last ? badge(last.packageState) : ''} ${mainBadgeM} ${linkedBadgesM}
-
+        <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${typeBdg}${obs2Badge} <strong>${tbr}</strong> ${last ? badge(last.packageState) : ''} ${mainBadgeM} ${linkedBadgesM}
           <span style="font-size:10px;background:rgba(0,0,0,.08);padding:2px 6px;border-radius:8px">Regra ${c.rule}</span>
-
         </span>
-
-        <span style="font-size:11px;color:#888">${isVal ? (c.analysisPart||[]).length + ' evento(s)' : 'MNR'} &#9662;</span>
-
+        <span style="font-size:11px;color:#888">${isVal ? sorted.length + ' evento(s)' : 'MNR'} &#9662;</span>
       </div>
-
       <div class="scc-cbody">${bodyContent}</div>`;
 
     container.appendChild(card);
-
   }
+
 
 
 
