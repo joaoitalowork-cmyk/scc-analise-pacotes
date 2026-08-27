@@ -4,7 +4,7 @@
 
 // @namespace    https://logistics.amazon.com
 
-// @version      2.9.0
+// @version      2.9.1
 
 // @description  Análise de TBRs no SCC: Missing, Lost, Ageing e Geral
 
@@ -598,16 +598,6 @@
       return { type: 'INDEVIDO', rule: 'A', obs: 'OBS2', possibleReversa,
         reason: 'MARKED AS MISSING + PAPERWORK RECEIVED nos eventos',
         triggerEvt: paperworkEvt };
-    }
-
-    // ─── INDEVIDO B — MARKED AS MISSING + EOD SCRUB (prioridade máxima)
-    const eodEvt = allEvents.find(e =>
-      normState(e) === 'EOD_SCRUB' || normReason(e) === 'EOD_SCRUB'
-    );
-    if (hasMissingEvt && eodEvt) {
-      return { type: 'INDEVIDO', rule: 'B', obs: 'OBS2', possibleReversa,
-        reason: 'MARKED AS MISSING + EOD SCRUB nos eventos',
-        triggerEvt: eodEvt };
     }
 
     // ─── INDEVIDO C — MARKED_AS_LOST / LOST em qualquer TBR
