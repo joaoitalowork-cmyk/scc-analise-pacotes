@@ -4,7 +4,7 @@
 
 // @namespace    https://logistics.amazon.com
 
-// @version      2.8.0
+// @version      2.9.0
 
 // @description  Análise de TBRs no SCC: Missing, Lost, Ageing e Geral
 
@@ -460,57 +460,93 @@
 
   function classifyMissing(result) {
     const { events } = result;
-    if (!events.length) return { type: 'MNR', rule: 0, reason: 'Sem eventos para analisar', sorted: [], analysisPart: [] };
+    if (!events.length) return { type: 'MNR', rule: 0, reason: 'Sem eventos para analisar' };
 
-    const sorted     = [...events].sort((a, b) => (a.stateTime || 0) - (b.stateTime || 0));
-    const normState  = e => (e.packageState || '').toUpperCase().replace(/\s+/g, '_');
-    const normReason = e => (e.reasonCode   || '').toUpperCase().replace(/\s+/g, '_');
+    // Ordena cronologicamente (mais antigo primeiro) usando stateTime
+    const sorted = [...events].sort((a, b) => (a.stateTime || 0) - (b.stateTime || 0));
 
-    const hasMissingEvt = sorted.some(e => normState(e) === 'MARKED_AS_MISSING');
+    // Só restringe a janela se MARKED_AS_MISSING for o TERMINAL.
+    // Se houver eventos depois, analisa tudo.
+    const endsWithMissing = (sorted[sorted.length - 1]?.packageState || '').toUpperCase() === 'MARKED_AS_MISSING';
+    const hasMissingAnywhere = sorted.some(e => (e.packageState || '').toUpperCase() === 'MARKED_AS_MISSING');
 
-    // ─── REGRA 1 — MARKED AS MISSING + PAPERWORK RECEIVED (OBS2, prioridade máxima)
-    const paperworkEvt = sorted.find(e =>
-      normState(e) === 'PAPERWORK_RECEIVED' || normReason(e) === 'PAPERWORK_RECEIVED'
-    );
-    if (hasMissingEvt && paperworkEvt) {
-      return {
-        type: 'MNR', rule: 1, obs: 'OBS2',
-        reason: 'MARKED AS MISSING + PAPERWORK RECEIVED detectados nos eventos',
-        triggerEvt: paperworkEvt,
-        analysisPart: sorted, sorted,
-      };
+    let analysisPart, hasMissing;
+    if (endsWithMissing) {
+      let cutIdx = sorted.length - 1;
+      while (cutIdx > 0 && (sorted[cutIdx - 1]?.packageState || '').toUpperCase() === 'MARKED_AS_MISSING') {
+        cutIdx--;
+      }
+      analysisPart = cutIdx > 0 ? sorted.slice(0, cutIdx) : sorted;
+      hasMissing   = true;
+    } else {
+      analysisPart = sorted;
+      hasMissing   = false;
     }
 
-    // ─── REGRA 2 — MARKED AS MISSING + EOD SCRUB (OBS2, prioridade máxima)
-    const eodEvt = sorted.find(e =>
-      normState(e) === 'EOD_SCRUB' || normReason(e) === 'EOD_SCRUB'
-    );
-    if (hasMissingEvt && eodEvt) {
-      return {
-        type: 'MNR', rule: 2, obs: 'OBS2',
-        reason: 'MARKED AS MISSING + EOD SCRUB detectados nos eventos',
-        triggerEvt: eodEvt,
-        analysisPart: sorted, sorted,
-      };
+    const lastEvt = analysisPart.length ? analysisPart[analysisPart.length - 1] : null;
+
+    // ─── REGRA 1 ─────────────────────────────────────────────────────
+    // Último evento da janela tem packageState OU reasonCode = EOD_SCRUB / PAPERWORK_RECEIVED
+    const MNR_TRIGGERS = ['EOD_SCRUB', 'PAPERWORK_RECEIVED'];
+    if (lastEvt) {
+      const evState  = (lastEvt.packageState || '').toUpperCase();
+      const evReason = (lastEvt.reasonCode   || '').toUpperCase();
+      const trigger  = MNR_TRIGGERS.find(t => t === evState || t === evReason);
+      if (trigger) {
+        const field = MNR_TRIGGERS.includes(evState) ? 'Status' : 'Motivo';
+        return {
+          type: 'MNR', rule: 1,
+          reason: `Último evento${hasMissing ? ' (anterior ao MARKED AS MISSING)' : ''} — ${field}: ${trigger.replace(/_/g, ' ')}`,
+          triggerEvt: lastEvt,
+          analysisPart, hasMissing, sorted,
+        };
+      }
     }
 
-    // ─── REGRA 3 — Qualquer login @amazon.com → VÁLIDO
-    const loginEvts = sorted.filter(e => isBaseLogin(e.scanAssociate));
+    // ─── REGRA 2 ─────────────────────────────────────────────────────
+    // MARKED FOR REPROCESS com origem diferente do destino do MANIFESTED
+    const manifestedEvt = sorted.find(e => (e.packageState || '').toUpperCase() === 'MANIFESTED') || sorted[0];
+    const reprocessEvt  = sorted.find(e => {
+      const s = (e.packageState || '').toUpperCase().replace(/[\s\-]+/g, '_');
+      return s.includes('MARKED_FOR_REPROCESS') || s.includes('FOR_REPROCESS');
+    });
+    if (reprocessEvt && manifestedEvt) {
+      const mDest = clean(manifestedEvt.destination);
+      const rSrc  = clean(reprocessEvt.source);
+      if (mDest !== '-' && rSrc !== '-' && mDest.toLowerCase() !== rSrc.toLowerCase()) {
+        return {
+          type: 'MNR', rule: 2,
+          reason: `MARKED FOR REPROCESS: origem "${rSrc}" ≠ destino do MANIFESTED "${mDest}"`,
+          manifestedEvt, reprocessEvt,
+          analysisPart, hasMissing, sorted,
+        };
+      }
+    }
+
+    // ─── REGRA 3 (LOGIN EDSP) ───────────────────────────────────────
+    // Login @amazon.com em base EDSP (S ou P) → VÁLIDO
+    const loginEvts = analysisPart.filter(e => isEdspEvent(e));
     if (loginEvts.length > 0) {
       return {
         type: 'VALIDO', rule: 3,
-        reason: loginEvts.length + ' login(s) @amazon.com detectado(s)',
-        loginEvts, analysisPart: sorted, sorted,
+        reason: loginEvts.length + ' movimentação(ões) em base EDSP detectada(s)',
+        loginEvts, analysisPart, hasMissing, sorted,
       };
     }
 
-    // ─── REGRA 4 — Nenhum login @amazon.com → MNR (só informa)
+    const nonEdspLogins = analysisPart.filter(e => isBaseLogin(e.scanAssociate) && !isEdspEvent(e));
+    const nonEdspNote = nonEdspLogins.length
+      ? ' (' + nonEdspLogins.length + ' login(s) em base não-EDSP desconsiderado(s))'
+      : '';
+
     return {
-      type: 'MNR', rule: 4,
-      reason: 'Nenhum login @amazon.com nos eventos',
-      analysisPart: sorted, sorted,
+      type: 'MNR', rule: 3,
+      reason: 'Nenhuma movimentação em base EDSP detectada' + nonEdspNote,
+      nonEdspLogins,
+      analysisPart, hasMissing, sorted,
     };
   }
+
 
 
 
@@ -537,29 +573,64 @@
   // ══════════════════════════════════════════════════════════
   // classifyLost — Regras de negócio para análise LOST
   // ══════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════
+  // classifyLost — Regras INDEVIDO / DEVIDO
+  // ══════════════════════════════════════════════════════════
   function classifyLost(result) {
     const { tbr, events, linkedTBRs = [] } = result;
     const allTBRs   = [{ id: tbr, isRTO: isRTO(tbr), events }, ...linkedTBRs];
     const allEvents = allTBRs.flatMap(t => t.events);
-    const normState = e => (e.packageState || '').toUpperCase().replace(/\s+/g, '_');
+    const normState  = e => (e.packageState || '').toUpperCase().replace(/\s+/g, '_');
+    const normReason = e => (e.reasonCode   || '').toUpperCase().replace(/\s+/g, '_');
 
-    // Regra 1 — LOST em qualquer TBR → INDEVIDO
-    const lostEvts = allEvents.filter(e => ['MARKED_AS_LOST','LOST'].includes(normState(e)));
-    const hasLost  = lostEvts.length > 0;
-
-    // Regra 4 — RTO com STOWED → Possível Reversa
+    // Possível Reversa: RTO com STOWED (verificado independente da classificação)
     const possibleReversa = allTBRs
       .filter(t => t.isRTO)
       .some(t => t.events.some(e => normState(e) === 'STOWED'));
 
-    // Regra 2 — movimentação em base EDSP
-    const edspEvts = allEvents.filter(e => isEDSPBase(e.scanLocation) || isEDSPBase(e.source));
-    const hasEDSP  = edspEvts.length > 0;
+    const hasMissingEvt = allEvents.some(e => normState(e) === 'MARKED_AS_MISSING');
 
-    if (hasLost) return { type: 'INDEVIDO', possibleReversa, lostEvts, hasEDSP, edspEvts };
-    if (hasEDSP) return { type: 'DEVIDO',   possibleReversa: false, lostEvts: [], hasEDSP: true, edspEvts };
-    return         { type: 'INDEVIDO',       possibleReversa, lostEvts: [], hasEDSP: false, edspEvts: [] };
+    // ─── INDEVIDO A — MARKED AS MISSING + PAPERWORK RECEIVED (prioridade máxima)
+    const paperworkEvt = allEvents.find(e =>
+      normState(e) === 'PAPERWORK_RECEIVED' || normReason(e) === 'PAPERWORK_RECEIVED'
+    );
+    if (hasMissingEvt && paperworkEvt) {
+      return { type: 'INDEVIDO', rule: 'A', obs: 'OBS2', possibleReversa,
+        reason: 'MARKED AS MISSING + PAPERWORK RECEIVED nos eventos',
+        triggerEvt: paperworkEvt };
+    }
+
+    // ─── INDEVIDO B — MARKED AS MISSING + EOD SCRUB (prioridade máxima)
+    const eodEvt = allEvents.find(e =>
+      normState(e) === 'EOD_SCRUB' || normReason(e) === 'EOD_SCRUB'
+    );
+    if (hasMissingEvt && eodEvt) {
+      return { type: 'INDEVIDO', rule: 'B', obs: 'OBS2', possibleReversa,
+        reason: 'MARKED AS MISSING + EOD SCRUB nos eventos',
+        triggerEvt: eodEvt };
+    }
+
+    // ─── INDEVIDO C — MARKED_AS_LOST / LOST em qualquer TBR
+    const lostEvts = allEvents.filter(e => ['MARKED_AS_LOST','LOST'].includes(normState(e)));
+    if (lostEvts.length > 0) {
+      return { type: 'INDEVIDO', rule: 'C', possibleReversa,
+        reason: 'Marcação LOST detectada nos eventos',
+        lostEvts };
+    }
+
+    // ─── DEVIDO — qualquer login @amazon.com
+    const loginEvts = allEvents.filter(e => isBaseLogin(e.scanAssociate));
+    if (loginEvts.length > 0) {
+      return { type: 'DEVIDO', rule: 'D', possibleReversa: false,
+        reason: loginEvts.length + ' login(s) @amazon.com detectado(s)',
+        loginEvts };
+    }
+
+    // ─── INDEVIDO E — Nenhum login @amazon.com
+    return { type: 'INDEVIDO', rule: 'E', possibleReversa,
+      reason: 'Nenhum login @amazon.com nos eventos' };
   }
+
 
   function buildTable(events, tid, isRTO, hlLogins, labelOverride, hlLostRows) {
 
@@ -639,81 +710,130 @@
     const isVal   = c.type === 'VALIDO';
     const sorted  = c.sorted || [...result.events].sort((a,b) => (a.stateTime||0)-(b.stateTime||0));
     const last    = sorted[sorted.length - 1];
-
-    const hdrBg  = isVal ? '#e8f0fe' : '#fff0f0';
-    const hdrFg  = isVal ? '#1a3c5e' : '#8b0000';
-
+    const hdrBg   = isVal ? '#e8f0fe' : '#fff0f0';
+    const hdrFg   = isVal ? '#1a3c5e' : '#8b0000';
     const typeBdg = isVal
       ? `<span style="background:#1a7a4a;color:#fff;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700">&#10004; VÁLIDO</span>`
       : `<span style="background:#c0392b;color:#fff;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700">&#10006; MNR</span>`;
-
-    const obs2Badge = c.obs === 'OBS2'
-      ? `<span style="background:#e74c3c;color:#fff;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:700;margin-left:4px;letter-spacing:.5px">OBS2</span>`
-      : '';
-
-    const mainIsRTO  = isRTO(tbr);
+    const mainIsRTO = isRTO(tbr);
     const mainBadgeM = mainIsRTO
       ? `<span style="background:#6c3483;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:6px;font-weight:700">RTO</span>`
       : `<span style="background:#1a7a4a;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:6px;font-weight:700">TBR Original</span>`;
-
     const linkedBadgesM = (result.linkedTBRs || []).map(lt =>
       lt.isRTO
         ? `<span style="background:#6c3483;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:4px">RTO: ${lt.id}</span>`
         : `<span style="background:#1a7a4a;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:4px">Original: ${lt.id}</span>`
     ).join('');
+    const rtoTag = mainBadgeM + linkedBadgesM;
 
-    const linkedSections = (result.linkedTBRs || []).filter(lt => lt.events.length).map(lt => {
-      const color = lt.isRTO ? '#6c3483' : '#1a7a4a';
-      const label = lt.isRTO
-        ? `<strong style="color:#6c3483">&#8617; RTO:</strong> ${lt.id}`
-        : `<strong style="color:#1a7a4a">&#128230; TBR Original:</strong> ${lt.id}`;
-      return `<div style="margin-top:14px;border-top:2px dashed ${color};padding-top:12px">
-        ${buildTable(displayOrder(lt.events), lt.id + (lt.isRTO ? ' (RTO)' : ' (TBR Original)'), lt.isRTO, true)}
-      </div>`;
-    }).join('');
+    // Nota sobre janela de análise
+    const allSorted = c.sorted || [];
+    const hasMissingInHistory = allSorted.some(e => (e.packageState || '').toUpperCase() === 'MARKED_AS_MISSING');
+    const windowNote = c.hasMissing
+      ? `<div style="font-size:11px;background:#fff8e1;border-left:3px solid #f0ad4e;padding:5px 10px;border-radius:3px;margin-bottom:8px;color:#856404">
+           &#128270; <strong>MARKED AS MISSING</strong> é o último evento — análise realizada nos eventos <strong>anteriores</strong> a ele
+         </div>`
+      : hasMissingInHistory
+        ? `<div style="font-size:11px;background:#e8f5e9;border-left:3px solid #1a7a4a;padding:5px 10px;border-radius:3px;margin-bottom:8px;color:#155724">
+             &#9989; Existem eventos <strong>MARKED AS MISSING</strong> no histórico, mas há movimentações <strong>posteriores</strong> — análise realizada em todos os eventos
+           </div>`
+        : '';
+
+    const postMissingEvts = (c.hasMissing && c.sorted)
+      ? (() => {
+          const cutIdx = c.sorted.findIndex(e => (e.packageState||'').toUpperCase() === 'MARKED_AS_MISSING');
+          return cutIdx >= 0 ? c.sorted.slice(cutIdx) : [];
+        })()
+      : [];
+    const postMissingSection = postMissingEvts.length
+      ? `<div style="margin-top:12px">
+           <div style="font-size:11px;color:#9b59b6;font-weight:600;margin-bottom:4px;padding:4px 8px;background:#f5effe;border-radius:4px;display:inline-block">
+             &#8627; Eventos a partir do MARKED AS MISSING (${postMissingEvts.length})
+           </div>
+           ${buildTable(displayOrder(postMissingEvts), tbr + ' (pós-missing)', false, false)}
+         </div>` : '';
 
     let bodyContent = '';
 
     if (isVal) {
-      // VÁLIDO — histórico completo com logins @amazon.com destacados em verde
       bodyContent = `
+        ${windowNote}
         <div style="font-size:12px;padding:6px 10px;background:#e8f5e9;border-left:4px solid #1a7a4a;border-radius:4px;margin-bottom:8px">
-          &#10003; ${c.reason} — logins destacados em <strong style="color:#155724">verde</strong>
+          &#10003; ${c.reason} — logins de base destacados em <strong style="color:#155724">verde</strong>
         </div>
-        ${buildTable(displayOrder(sorted), tbr, mainIsRTO, true)}
-        ${linkedSections}`;
+        ${buildTable(displayOrder(c.analysisPart), tbr, false, true)}
+        ${postMissingSection}
+        ${(result.linkedTBRs || []).filter(lt => lt.events.length).map(lt =>
+          `<div style="margin-top:14px;border-top:2px dashed ${lt.isRTO ? '#6c3483' : '#1a7a4a'};padding-top:12px">${buildTable(displayOrder(lt.events), lt.id + (lt.isRTO ? ' (RTO)' : ' (TBR Original)'), true, true)}</div>`
+        ).join('')}`;
 
-    } else if (c.rule === 1 || c.rule === 2) {
-      // MNR OBS2 — evento gatilho + histórico completo
-      const ev  = c.triggerEvt;
-      const lbl = c.rule === 1 ? 'PAPERWORK RECEIVED' : 'EOD SCRUB';
+    } else if (c.rule === 1) {
+      const ev = c.triggerEvt;
+      const evState = (ev?.packageState || '').replace(/_/g,' ');
       bodyContent = `
-        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:10px">
-          <div style="font-size:13px;color:#8b0000;font-weight:700;margin-bottom:6px">&#9888; MNR OBS2 — ${c.reason}</div>
-          ${ev ? `<table style="font-size:12px;border-collapse:collapse;width:100%;margin-top:4px">
+        ${windowNote}
+        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:8px">
+          <div style="font-size:13px;color:#8b0000;font-weight:700;margin-bottom:4px">&#9888; MNR — Regra 1: Último evento inválido</div>
+          <div style="font-size:12px;color:#555">${c.reason}</div>
+          ${ev ? `<table style="margin-top:8px;font-size:12px;border-collapse:collapse;width:100%">
             <tr style="background:#fce8e6">
               <td style="padding:5px 8px;border:1px solid #f5c6cb;font-weight:600;white-space:nowrap">Evento gatilho</td>
               <td style="padding:5px 8px;border:1px solid #f5c6cb">${fmtDate(ev.stateTime)}</td>
-              <td style="padding:5px 8px;border:1px solid #f5c6cb"><strong>${lbl}</strong></td>
+              <td style="padding:5px 8px;border:1px solid #f5c6cb"><strong>${evState}</strong></td>
               <td style="padding:5px 8px;border:1px solid #f5c6cb">${clean(ev.source)}</td>
               <td style="padding:5px 8px;border:1px solid #f5c6cb">${clean(ev.destination)}</td>
             </tr></table>` : ''}
         </div>
-        ${buildTable(displayOrder(sorted), tbr, mainIsRTO, false)}
-        ${linkedSections}`;
+        ${postMissingSection}`;
+
+    } else if (c.rule === 2) {
+      const mEv = c.manifestedEvt;
+      const rEv = c.reprocessEvt;
+      bodyContent = `
+        ${windowNote}
+        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:8px">
+          <div style="font-size:13px;color:#8b0000;font-weight:700;margin-bottom:4px">&#9888; MNR — Regra 2: Reprocessamento em local incorreto</div>
+          <div style="font-size:12px;color:#555;margin-bottom:8px">${c.reason}</div>
+          <table style="font-size:12px;border-collapse:collapse;width:auto">
+            <tr style="background:#e8f0fe">
+              <th style="padding:5px 10px;border:1px solid #c5d5f5;text-align:left">Evento</th>
+              <th style="padding:5px 10px;border:1px solid #c5d5f5;text-align:left">Data/Hora</th>
+              <th style="padding:5px 10px;border:1px solid #c5d5f5;text-align:left">Origem</th>
+              <th style="padding:5px 10px;border:1px solid #c5d5f5;text-align:left">Destino</th>
+            </tr>
+            ${mEv ? `<tr style="background:#f8f9fa">
+              <td style="padding:5px 10px;border:1px solid #dee2e6;white-space:nowrap"><strong>MANIFESTED</strong></td>
+              <td style="padding:5px 10px;border:1px solid #dee2e6">${fmtDate(mEv.stateTime)}</td>
+              <td style="padding:5px 10px;border:1px solid #dee2e6">${clean(mEv.source)}</td>
+              <td style="padding:5px 10px;border:1px solid #dee2e6;background:#fff3cd;font-weight:700">${clean(mEv.destination)}</td>
+            </tr>` : ''}
+            ${rEv ? `<tr style="background:#fff5f5">
+              <td style="padding:5px 10px;border:1px solid #dee2e6;white-space:nowrap"><strong>MARKED FOR REPROCESS</strong></td>
+              <td style="padding:5px 10px;border:1px solid #dee2e6">${fmtDate(rEv.stateTime)}</td>
+              <td style="padding:5px 10px;border:1px solid #dee2e6;background:#fce8e6;font-weight:700">${clean(rEv.source)}</td>
+              <td style="padding:5px 10px;border:1px solid #dee2e6">${clean(rEv.destination)}</td>
+            </tr>` : ''}
+          </table>
+        </div>
+        ${postMissingSection}`;
 
     } else {
-      // MNR Regra 4 — nenhum login @amazon.com, só informa (sem histórico)
+      const nonEdspNote = (c.nonEdspLogins && c.nonEdspLogins.length)
+        ? `<div style="font-size:11px;margin-top:8px;padding:5px 10px;background:#fff8e1;border-left:3px solid #f0ad4e;border-radius:3px;color:#856404">
+             &#9888; ${c.nonEdspLogins.length} login(s) Amazon detectado(s) em base não-EDSP (desconsiderado):
+             <strong>${[...new Set(c.nonEdspLogins.map(e => clean(e.scanLocation) !== '-' ? clean(e.scanLocation) : clean(e.source)))].join(', ')}</strong>
+           </div>` : '';
       bodyContent = `
-        <div style="padding:12px 16px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px">
+        ${windowNote}
+        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px">
           <div style="display:flex;align-items:center;gap:10px">
-            <span style="font-size:22px">&#9888;</span>
-            <div>
-              <strong style="font-size:13px;color:#8b0000">MNR — Nenhum login @amazon.com</strong><br>
-              <span style="font-size:12px;color:#666">${c.reason}</span>
-            </div>
+            <span style="font-size:20px">&#9888;</span>
+            <div><strong style="font-size:13px;color:#8b0000">MNR — Sem movimentação em base EDSP</strong><br>
+              <span style="font-size:12px;color:#666">${c.reason}</span></div>
           </div>
-        </div>`;
+          ${nonEdspNote}
+        </div>
+        ${postMissingSection}`;
     }
 
     const card = document.createElement('div');
@@ -721,16 +841,16 @@
     card.innerHTML = `
       <div class="scc-chdr" style="background:${hdrBg};color:${hdrFg}"
            onclick="(function(el){var b=el.nextElementSibling;b.style.display=b.style.display==='none'?'':'none';})(this)">
-        <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          ${typeBdg}${obs2Badge} <strong>${tbr}</strong> ${last ? badge(last.packageState) : ''} ${mainBadgeM} ${linkedBadgesM}
+        <span style="display:flex;align-items:center;gap:8px">
+          ${typeBdg} <strong>${tbr}</strong> ${last ? badge(last.packageState) : ''} ${mainBadgeM} ${linkedBadgesM}
           <span style="font-size:10px;background:rgba(0,0,0,.08);padding:2px 6px;border-radius:8px">Regra ${c.rule}</span>
         </span>
-        <span style="font-size:11px;color:#888">${isVal ? sorted.length + ' evento(s)' : 'MNR'} &#9662;</span>
+        <span style="font-size:11px;color:#888">${isVal ? (c.analysisPart||[]).length + ' evento(s)' : 'MNR'} &#9662;</span>
       </div>
       <div class="scc-cbody">${bodyContent}</div>`;
-
     container.appendChild(card);
   }
+
 
 
 
@@ -739,20 +859,26 @@
   // ══════════════════════════════════════════════════════════
   // renderLostCard
   // ══════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════
+  // renderLostCard
+  // ══════════════════════════════════════════════════════════
   function renderLostCard(result, container) {
     const { tbr } = result;
     const c        = classifyLost(result);
     const isIndev  = c.type === 'INDEVIDO';
-
-    const hdrBg  = isIndev ? '#fff0f0' : '#e8f5e9';
-    const hdrFg  = isIndev ? '#8b0000' : '#1a3c5e';
-    const border = isIndev ? '#c0392b' : '#1a7a4a';
+    const hdrBg    = isIndev ? '#fff0f0' : '#e8f5e9';
+    const hdrFg    = isIndev ? '#8b0000' : '#1a3c5e';
+    const border   = isIndev ? '#c0392b' : '#1a7a4a';
 
     const typeBadge = isIndev
       ? `<span style="background:#c0392b;color:#fff;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700">&#10006; INDEVIDO</span>`
       : `<span style="background:#1a7a4a;color:#fff;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700">&#10004; DEVIDO</span>`;
 
-    const reversaBadge = c.possibleReversa
+    const obs2Badge = c.obs === 'OBS2'
+      ? `<span style="background:#e74c3c;color:#fff;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:700;margin-left:4px">OBS2</span>`
+      : '';
+
+    const reversaBadge = (isIndev && c.possibleReversa)
       ? `<span style="background:#e67e22;color:#fff;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700;margin-left:6px">&#9654; Poss\u00edvel Reversa</span>`
       : '';
 
@@ -767,44 +893,83 @@
         : `<span style="background:#1a7a4a;color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;margin-left:4px">Original: ${lt.id}</span>`
     ).join('');
 
-    const edspNote = (isIndev && c.hasEDSP)
-      ? `<div style="font-size:11px;background:#fff8e1;border-left:3px solid #f0ad4e;padding:5px 10px;border-radius:3px;margin-bottom:8px;color:#856404">
-           &#9889; Aten\u00e7\u00e3o: h\u00e1 movimenta\u00e7\u00e3o em base EDSP mesmo com marca\u00e7\u00e3o LOST
-         </div>`
-      : '';
-
-    const edspDueNote = (!isIndev && c.hasEDSP)
-      ? `<div style="font-size:11px;background:#e8f5e9;border-left:3px solid #1a7a4a;padding:5px 10px;border-radius:3px;margin-bottom:8px;color:#155724">
-           &#10003; Movimenta\u00e7\u00e3o confirmada em base EDSP \u2014 classifica\u00e7\u00e3o DEVIDO
-         </div>`
-      : '';
-
     const sorted = [...result.events].sort((a,b) => (a.stateTime||0)-(b.stateTime||0));
 
+    // Seções linked TBRs
     const linkedSections = (result.linkedTBRs || []).filter(lt => lt.events.length).map(lt => {
       const color = lt.isRTO ? '#6c3483' : '#1a7a4a';
       const label = lt.isRTO
         ? `<strong style="color:#6c3483">&#8617; RTO:</strong> ${lt.id}`
         : `<strong style="color:#1a7a4a">&#128230; TBR Original:</strong> ${lt.id}`;
       return `<div style="margin-top:14px;border-top:2px dashed ${color};padding-top:12px">
-        ${buildTable(displayOrder(lt.events), lt.id, lt.isRTO, false, label, true)}
+        ${buildTable(displayOrder(lt.events), lt.id, lt.isRTO, !isIndev, label, isIndev)}
       </div>`;
     }).join('');
 
-    const body = `${edspNote}${edspDueNote}
-      ${buildTable(displayOrder(sorted), tbr, mainIsRTO, false, null, true)}
-      ${linkedSections}`;
+    let bodyContent = '';
+
+    if (!isIndev) {
+      // DEVIDO — histórico com logins @amazon.com destacados
+      bodyContent = `
+        <div style="font-size:12px;padding:6px 10px;background:#e8f5e9;border-left:4px solid #1a7a4a;border-radius:4px;margin-bottom:8px">
+          &#10003; ${c.reason} — logins destacados em <strong style="color:#155724">verde</strong>
+        </div>
+        ${buildTable(displayOrder(sorted), tbr, mainIsRTO, true, null, false)}
+        ${linkedSections}`;
+
+    } else if (c.rule === 'A' || c.rule === 'B') {
+      // INDEVIDO OBS2 — evento gatilho destacado + histórico completo
+      const ev  = c.triggerEvt;
+      const lbl = c.rule === 'A' ? 'PAPERWORK RECEIVED' : 'EOD SCRUB';
+      bodyContent = `
+        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:10px">
+          <div style="font-size:13px;color:#8b0000;font-weight:700;margin-bottom:6px">&#9888; INDEVIDO OBS2 — ${c.reason}</div>
+          ${ev ? `<table style="font-size:12px;border-collapse:collapse;width:100%;margin-top:4px">
+            <tr style="background:#fce8e6">
+              <td style="padding:5px 8px;border:1px solid #f5c6cb;font-weight:600;white-space:nowrap">Evento gatilho</td>
+              <td style="padding:5px 8px;border:1px solid #f5c6cb">${fmtDate(ev.stateTime)}</td>
+              <td style="padding:5px 8px;border:1px solid #f5c6cb"><strong>${lbl}</strong></td>
+              <td style="padding:5px 8px;border:1px solid #f5c6cb">${clean(ev.source)}</td>
+              <td style="padding:5px 8px;border:1px solid #f5c6cb">${clean(ev.destination)}</td>
+            </tr></table>` : ''}
+        </div>
+        ${buildTable(displayOrder(sorted), tbr, mainIsRTO, false, null, true)}
+        ${linkedSections}`;
+
+    } else if (c.rule === 'C') {
+      // INDEVIDO — marcação LOST, linhas destacadas em vermelho
+      bodyContent = `
+        <div style="font-size:12px;padding:6px 10px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:8px">
+          &#10006; ${c.reason} — linha(s) LOST destacada(s) em <strong style="color:#c0392b">vermelho</strong>
+        </div>
+        ${buildTable(displayOrder(sorted), tbr, mainIsRTO, false, null, true)}
+        ${linkedSections}`;
+
+    } else {
+      // INDEVIDO E — sem login @amazon.com, histórico completo
+      bodyContent = `
+        <div style="padding:10px 14px;background:#fff5f5;border-left:4px solid #c0392b;border-radius:4px;margin-bottom:10px">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:20px">&#9888;</span>
+            <div><strong style="font-size:13px;color:#8b0000">INDEVIDO — ${c.reason}</strong></div>
+          </div>
+        </div>
+        ${buildTable(displayOrder(sorted), tbr, mainIsRTO, false, null, false)}
+        ${linkedSections}`;
+    }
 
     container.insertAdjacentHTML('beforeend', `
       <div style="border:2px solid ${border};border-radius:8px;margin-bottom:12px;overflow:hidden;box-shadow:0 2px 6px rgba(0,0,0,.12)">
         <div style="background:${hdrBg};padding:10px 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;border-bottom:2px solid ${border}">
-          ${typeBadge}${reversaBadge}
+          ${typeBadge}${obs2Badge}${reversaBadge}
           <span style="font-weight:700;font-size:13px;color:${hdrFg}">${tbr}</span>
           ${mainBadge}${linkedBadges}
         </div>
-        <div style="padding:12px 14px">${body}</div>
-      </div>`);
+        <div style="padding:12px 14px">${bodyContent}</div>
+      </div>`
+      .replace('${bodyContent}', bodyContent));
   }
+
 
   function renderGeralCard(result, container) {
 
